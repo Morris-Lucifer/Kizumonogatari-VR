@@ -1,0 +1,538 @@
+--- a/shadps4-arm64-main/src/core/libraries/move/move.cpp
++++ b/shadps4-arm64-main/src/core/libraries/move/move.cpp
+@@ -1,122 +1,174 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <mutex>
+ #include "common/logging/log.h"
+ #include "core/libraries/error_codes.h"
+ #include "core/libraries/libs.h"
+ #include "core/libraries/move/move.h"
+ #include "core/libraries/move/move_error.h"
+-#include "move.h"
++#include "core/vr/vr_runtime.h"
+ 
+ namespace Libraries::Move {
++namespace {
++std::atomic<bool> g_library_initialized{};
++std::mutex g_handles_mutex;
++std::array<s32, 2> g_handles{-1, -1};
++s32 g_next_handle = 0x30b0000;
+ 
+-static bool g_library_initialized = false;
++s32 Read(s32 handle, Core::Vr::MoveState& state) {
++    if (!g_library_initialized) return ORBIS_MOVE_ERROR_NOT_INIT;
++    const auto hand = HandForHandle(handle);
++    if (!hand) return ORBIS_MOVE_ERROR_INVALID_HANDLE;
++    state = Core::Vr::Runtime::Instance().GetMove(*hand);
++    return state.connected ? ORBIS_OK : ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++}
++
++void WriteData(const Core::Vr::MoveState& state, OrbisMoveData& data) {
++    data = {};
++    const auto inverse = Core::Vr::Conjugate(state.device.pose.orientation);
++    const auto gravity = Core::Vr::Rotate(inverse, {0, 1, 0});
++    const auto gyro = Core::Vr::Rotate(inverse, state.device.angular_velocity);
++    data.accelerometer[0] = gravity.x;
++    data.accelerometer[1] = gravity.y;
++    data.accelerometer[2] = gravity.z;
++    data.gyro[0] = gyro.x;
++    data.gyro[1] = gyro.y;
++    data.gyro[2] = gyro.z;
++    data.button_data.button_data = static_cast<u16>(state.buttons);
++    data.button_data.trigger_data = static_cast<u16>(std::lround(std::clamp(state.trigger, 0.0f, 1.0f) * 255.0f));
++    data.timestamp = static_cast<s64>(state.timestamp);
++    data.count = static_cast<s32>(state.device.sequence & 0x7fffffff);
++    data.temperature = 25.0f;
++}
++}
++
++std::optional<u32> HandForHandle(s32 handle) {
++    std::scoped_lock lock{g_handles_mutex};
++    if (!g_library_initialized || handle < 0) return std::nullopt;
++    for (u32 hand = 0; hand < g_handles.size(); ++hand)
++        if (g_handles[hand] == handle) return hand;
++    return std::nullopt;
++}
+ 
+ s32 PS4_SYSV_ABI sceMoveInit() {
+-    if (g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_ALREADY_INIT;
+-    }
+-    LOG_WARNING(Lib_Move, "Move controllers are not supported yet");
++    std::scoped_lock lock{g_handles_mutex};
++    if (g_library_initialized) return ORBIS_MOVE_ERROR_ALREADY_INIT;
++    g_handles.fill(-1);
+     g_library_initialized = true;
++    LOG_INFO(Lib_Move, "KIZU_MOVE independent Touch controllers enabled");
+     return ORBIS_OK;
+ }
+ 
+-s32 PS4_SYSV_ABI sceMoveOpen(Libraries::UserService::OrbisUserServiceUserId user_id, s32 type,
+-                             s32 index) {
+-    LOG_DEBUG(Lib_Move, "called");
+-    if (!g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_NOT_INIT;
+-    }
+-    // Even when no controllers are connected, this returns a proper handle.
+-    // Internal libSceVrTracker logic requires this handle to be different from other devices.
+-    static s32 handle = 0x30b0000;
+-    return handle += 0x100;
++s32 PS4_SYSV_ABI sceMoveOpen(Libraries::UserService::OrbisUserServiceUserId user_id,
++                           s32 type, s32 index) {
++    std::scoped_lock lock{g_handles_mutex};
++    if (!g_library_initialized) return ORBIS_MOVE_ERROR_NOT_INIT;
++    if (index < 0 || index >= 2) return ORBIS_MOVE_ERROR_INVALID_ARG;
++    // CUSA09079's interactive right hand uses the first Move slot.
++    // Runtime/protocol hand IDs stay physical: 0 = left, 1 = right.
++    const u32 hand = 1u - static_cast<u32>(index);
++    if (g_handles[hand] >= 0) return ORBIS_MOVE_ERROR_ALREADY_OPENED;
++    const s32 handle = g_next_handle += 0x100;
++    g_handles[hand] = handle;
++    LOG_INFO(Lib_Move, "KIZU_MOVE open user={} type={} index={} physical_hand={} handle={:#x}", user_id, type, index, hand, handle);
++    return handle;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveGetDeviceInfo(s32 handle, OrbisMoveDeviceInfo* info) {
+-    LOG_TRACE(Lib_Move, "called");
+-    if (!g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_NOT_INIT;
+-    }
+-    if (info == nullptr) {
+-        return ORBIS_MOVE_ERROR_INVALID_ARG;
+-    }
+-    return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    if (!g_library_initialized) return ORBIS_MOVE_ERROR_NOT_INIT;
++    if (!info) return ORBIS_MOVE_ERROR_INVALID_ARG;
++    Core::Vr::MoveState state;
++    const s32 result = Read(handle, state);
++    if (result != ORBIS_OK) return result;
++    *info = {};
++    info->sphere_radius = 0.0225f;
++    info->accelerometer_offset[1] = -0.12f;
++    return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveReadStateLatest(s32 handle, OrbisMoveData* data) {
+-    LOG_TRACE(Lib_Move, "(called");
+-    if (!g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_NOT_INIT;
+-    }
+-    if (data == nullptr) {
+-        return ORBIS_MOVE_ERROR_INVALID_ARG;
+-    }
+-    return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    if (!g_library_initialized) return ORBIS_MOVE_ERROR_NOT_INIT;
++    if (!data) return ORBIS_MOVE_ERROR_INVALID_ARG;
++    Core::Vr::MoveState state;
++    const s32 result = Read(handle, state);
++    if (result == ORBIS_OK) WriteData(state, *data);
++    return result;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveReadStateRecent(s32 handle, s64 timestamp, OrbisMoveData* data,
+-                                        s32* out_count) {
+-    LOG_TRACE(Lib_Move, "called");
+-    if (!g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_NOT_INIT;
++                                     s32* out_count) {
++    if (!g_library_initialized) return ORBIS_MOVE_ERROR_NOT_INIT;
++    if (timestamp < 0 || !data || !out_count) return ORBIS_MOVE_ERROR_INVALID_ARG;
++    *out_count = 0;
++    Core::Vr::MoveState state;
++    const s32 result = Read(handle, state);
++    if (result != ORBIS_OK) return result;
++    if (state.timestamp > static_cast<u64>(timestamp)) {
++        WriteData(state, *data);
++        *out_count = 1;
+     }
+-    if (timestamp < 0 || data == nullptr || out_count == nullptr) {
+-        return ORBIS_MOVE_ERROR_INVALID_ARG;
+-    }
+-    return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveGetExtensionPortInfo(s32 handle, void* data) {
+-    LOG_TRACE(Lib_Move, "called");
+-    if (!g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_NOT_INIT;
+-    }
+-    if (data == nullptr) {
+-        return ORBIS_MOVE_ERROR_INVALID_ARG;
+-    }
++    if (!g_library_initialized) return ORBIS_MOVE_ERROR_NOT_INIT;
++    if (!data) return ORBIS_MOVE_ERROR_INVALID_ARG;
++    if (!HandForHandle(handle)) return ORBIS_MOVE_ERROR_INVALID_HANDLE;
++    // There is no extension accessory attached to the virtual Move.
+     return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveSetVibration(s32 handle, u8 intensity) {
+-    LOG_TRACE(Lib_Move, "called");
+-    if (!g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_NOT_INIT;
+-    }
+-    return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    Core::Vr::MoveState state;
++    const s32 result = Read(handle, state);
++    if (result != ORBIS_OK) return result;
++    if (const auto hand = HandForHandle(handle))
++        Core::Vr::Runtime::Instance().SetMoveVibration(*hand, intensity);
++    return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveSetLightSphere(s32 handle, u8 red, u8 green, u8 blue) {
+-    LOG_TRACE(Lib_Move, "called");
+-    if (!g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_NOT_INIT;
+-    }
+-    return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    Core::Vr::MoveState state;
++    return Read(handle, state); // Touch has no programmable light sphere.
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveResetLightSphere(s32 handle) {
+-    LOG_TRACE(Lib_Move, "called");
+-    if (!g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_NOT_INIT;
+-    }
+-    // Returns success, even if no controllers are connected.
+-    return ORBIS_OK;
++    if (!g_library_initialized) return ORBIS_MOVE_ERROR_NOT_INIT;
++    return HandForHandle(handle) ? ORBIS_OK : ORBIS_MOVE_ERROR_INVALID_HANDLE;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveClose(s32 handle) {
+-    LOG_DEBUG(Lib_Move, "called");
+-    if (!g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_NOT_INIT;
++    std::optional<u32> closed;
++    {
++        std::scoped_lock lock{g_handles_mutex};
++        if (!g_library_initialized) return ORBIS_MOVE_ERROR_NOT_INIT;
++        for (u32 hand = 0; hand < g_handles.size(); ++hand) {
++            if (g_handles[hand] == handle && handle >= 0) {
++                g_handles[hand] = -1;
++                closed = hand;
++                break;
++            }
++        }
+     }
++    if (!closed) return ORBIS_MOVE_ERROR_INVALID_HANDLE;
++    Core::Vr::Runtime::Instance().SetMoveVibration(*closed, 0);
+     return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveTerm() {
+-    LOG_DEBUG(Lib_Move, "called");
+-    if (!g_library_initialized) {
+-        return ORBIS_MOVE_ERROR_NOT_INIT;
++    {
++        std::scoped_lock lock{g_handles_mutex};
++        if (!g_library_initialized) return ORBIS_MOVE_ERROR_NOT_INIT;
++        g_library_initialized = false;
++        g_handles.fill(-1);
+     }
+-    g_library_initialized = false;
++    for (u32 hand = 0; hand < 2; ++hand)
++        Core::Vr::Runtime::Instance().SetMoveVibration(hand, 0);
+     return ORBIS_OK;
+ }
+ 
+@@ -134,4 +186,4 @@
+     LIB_FUNCTION("tsZi60H4ypY", "libSceMove", 1, "libSceMove", sceMoveTerm);
+ };
+ 
+-} // namespace Libraries::Move
+\ No newline at end of file
++} // namespace Libraries::Move
+--- a/shadps4-arm64-main/src/core/libraries/move/move.h
++++ b/shadps4-arm64-main/src/core/libraries/move/move.h
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #pragma once
++#include <optional>
+ 
+ #include "common/types.h"
+ #include "core/libraries/system/userservice.h"
+@@ -43,5 +44,8 @@
+     float temperature;
+ };
+ 
++/// Stable hand association shared with libSceVrTracker; absent for closed handles.
++std::optional<u32> HandForHandle(s32 handle);
++
+ void RegisterLib(Core::Loader::SymbolsResolver* sym);
+-} // namespace Libraries::Move
+\ No newline at end of file
++} // namespace Libraries::Move
+--- a/shadps4-arm64-main/src/core/libraries/vr_tracker/vr_tracker.cpp
++++ b/shadps4-arm64-main/src/core/libraries/vr_tracker/vr_tracker.cpp
+@@ -14,6 +14,7 @@
+ #include "core/libraries/kernel/time.h"
+ #include "core/libraries/libs.h"
+ #include "core/libraries/vr_tracker/vr_tracker.h"
++#include "core/libraries/move/move.h"
+ #include "core/known_title.h"
+ #include "core/libraries/vr_tracker/vr_tracker_error.h"
+ #include "core/memory.h"
+@@ -391,14 +392,29 @@
+     result->user_frame_number = param->user_frame_number;
+     result->camera_orientation_w = 1.0f;
+ 
+-    // Only the headset and the first controller are tracked by the host.
+-    if (!HeadsetConnected() || (!is_hmd && !is_pad)) {
++    const auto move_hand = HasMove(handle) ? Libraries::Move::HandForHandle(handle) : std::nullopt;
++    if (!HeadsetConnected() || (!is_hmd && !is_pad && !move_hand)) {
+         result->status = OrbisVrTrackerStatus::ORBIS_VR_TRACKER_STATUS_NOT_TRACKING;
+         return ORBIS_OK;
+     }
+ 
+     auto& runtime = Core::Vr::Runtime::Instance();
+-    const Core::Vr::DeviceState state = is_hmd ? runtime.GetHead() : runtime.GetPad();
++    const Core::Vr::MoveState move = move_hand ? runtime.GetMove(*move_hand) : Core::Vr::MoveState{};
++    const Core::Vr::DeviceState state = move_hand ? move.device : is_hmd ? runtime.GetHead() : runtime.GetPad();
++    if (move_hand) {
++        result->connected = move.connected;
++        if (!move.connected || !state.tracked) {
++            result->status = OrbisVrTrackerStatus::ORBIS_VR_TRACKER_STATUS_NOT_TRACKING;
++            return ORBIS_OK;
++        }
++        static std::array<std::atomic<u32>, 2> calls{};
++        const u32 call = calls[*move_hand].fetch_add(1);
++        if (call < 3 || call % 600 == 0) {
++            LOG_INFO(Lib_VrTracker, "KIZU_MOVE tracked hand={} handle={:#x} seq={} p={:.3f},{:.3f},{:.3f} buttons={:#x} trigger={:.2f}",
++                     *move_hand, handle, state.sequence, state.pose.position.x,
++                     state.pose.position.y, state.pose.position.z, move.buttons, move.trigger);
++        }
++    }
+ 
+     static std::atomic<u32> result_calls{};
+     if (const u32 call = result_calls.fetch_add(1); call < 4 || call % 1200 == 0) {
+@@ -432,6 +448,11 @@
+     result->angular_velocity_y = state.angular_velocity.y;
+     result->angular_velocity_z = state.angular_velocity.z;
+ 
++    if (move_hand) {
++        result->led_color = *move_hand == 0 ? ORBIS_VR_TRACKER_LED_COLOR_CYAN : ORBIS_VR_TRACKER_LED_COLOR_MAGENTA;
++        WritePose(result->move_info.device_pose, state.pose);
++        return ORBIS_OK;
++    }
+     if (is_pad) {
+         WritePose(result->pad_info.device_pose, state.pose);
+         return ORBIS_OK;
+--- a/shadps4-arm64-main/src/core/vr/vr_host_link.cpp
++++ b/shadps4-arm64-main/src/core/vr/vr_host_link.cpp
+@@ -3,9 +3,12 @@
+ 
+ #include <cstdlib>
+ #include <cstring>
++#include <cmath>
++#include <algorithm>
+ 
+ #include "common/logging/log.h"
+ #include "common/thread.h"
++#include "core/libraries/kernel/time.h"
+ #include "core/vr/vr_host_link.h"
+ #include "core/vr/vr_runtime.h"
+ 
+@@ -94,6 +97,14 @@
+         message.blue = feedback.blue;
+         SendPadFeedback(message);
+     });
++    Runtime::Instance().SetMoveFeedbackListener([this](u32 hand, u8 intensity) {
++        Protocol::MoveFeedback message;
++        message.hand = hand;
++        message.intensity = intensity;
++        if (!IsConnected()) return;
++        std::scoped_lock lock{send_mutex};
++        ::send(fd, &message, sizeof(message), MSG_NOSIGNAL | MSG_DONTWAIT);
++    });
+     return true;
+ }
+ 
+@@ -129,6 +140,7 @@
+         Protocol::Pose pose;
+         Protocol::Optics optics;
+         Protocol::PadPose pad_pose;
++        Protocol::MoveInput move_input;
+         Protocol::Refresh refresh;
+     };
+ 
+@@ -182,6 +194,29 @@
+         }
+ 
+         switch (message.header.type) {
++        case Protocol::MessageType::MoveInput: {
++            if (size != static_cast<ssize_t>(sizeof(Protocol::MoveInput))) break;
++            const auto& input = message.move_input;
++            if (input.hand >= 2) break;
++            MoveState state;
++            state.connected = (input.flags & Protocol::MoveInput::Connected) != 0;
++            state.device.tracked = state.connected && (input.flags & Protocol::MoveInput::Tracked) != 0;
++            bool finite = std::isfinite(input.trigger);
++            for (float value : input.position) finite &= std::isfinite(value);
++            for (float value : input.orientation) finite &= std::isfinite(value);
++            for (float value : input.linear_velocity) finite &= std::isfinite(value);
++            for (float value : input.angular_velocity) finite &= std::isfinite(value);
++            if (!finite) break;
++            state.device.pose.position = {input.position[0], input.position[1], input.position[2]};
++            state.device.pose.orientation = Normalize({input.orientation[0], input.orientation[1], input.orientation[2], input.orientation[3]});
++            state.device.linear_velocity = {input.linear_velocity[0], input.linear_velocity[1], input.linear_velocity[2]};
++            state.device.angular_velocity = {input.angular_velocity[0], input.angular_velocity[1], input.angular_velocity[2]};
++            state.buttons = state.connected ? input.buttons & 0xffffu : 0;
++            state.trigger = state.connected ? std::clamp(input.trigger, 0.0f, 1.0f) : 0;
++            state.timestamp = Libraries::Kernel::sceKernelGetProcessTime();
++            runtime.UpdateMove(input.hand, state);
++            break;
++        }
+         case Protocol::MessageType::Pose: {
+             if (size < static_cast<ssize_t>(sizeof(Protocol::Pose))) {
+                 break;
+--- a/shadps4-arm64-main/src/core/vr/vr_protocol.h
++++ b/shadps4-arm64-main/src/core/vr/vr_protocol.h
+@@ -24,6 +24,8 @@
+     PadPose = 5,
+     PadFeedback = 6,
+     Refresh = 7,
++    MoveInput = 8,
++    MoveFeedback = 9,
+ };
+ 
+ struct Header {
+@@ -135,4 +137,29 @@
+     std::uint8_t reserved[3]{};
+ };
+ 
++/// Host to emulator: one independently tracked Touch controller acting as a Move.
++/// The position is the virtual sphere in host space; orientation follows the grip pose.
++struct MoveInput {
++    static constexpr std::uint32_t Connected = 1u << 0;
++    static constexpr std::uint32_t Tracked = 1u << 1;
++    Header header{.type = MessageType::MoveInput};
++    std::uint32_t hand{}; // 0 left, 1 right
++    std::uint32_t flags{};
++    std::uint32_t buttons{}; // libSceMove's compact 16-bit button layout
++    float trigger{}; // 0..1
++    float position[3]{};
++    float orientation[4]{0, 0, 0, 1};
++    float linear_velocity[3]{};
++    float angular_velocity[3]{};
++};
++
++struct MoveFeedback {
++    Header header{.type = MessageType::MoveFeedback};
++    std::uint32_t hand{};
++    std::uint32_t intensity{}; // 0..255
++};
++
++static_assert(sizeof(MoveInput) == 76);
++static_assert(sizeof(MoveFeedback) == 16);
++
+ } // namespace Core::Vr::Protocol
+--- a/shadps4-arm64-main/src/core/vr/vr_runtime.cpp
++++ b/shadps4-arm64-main/src/core/vr/vr_runtime.cpp
+@@ -360,6 +360,49 @@
+     pad_position_tracked = true;
+ }
+ 
++void Runtime::UpdateMove(u32 hand, const MoveState& state) {
++    if (hand >= host_moves.size()) return;
++    std::scoped_lock lock{mutex};
++    const u64 sequence = host_moves[hand].device.sequence + 1;
++    host_moves[hand] = state;
++    host_moves[hand].device.sequence = sequence;
++    move_received[hand] = std::chrono::steady_clock::now();
++}
++
++MoveState Runtime::GetMove(u32 hand) const {
++    std::scoped_lock lock{mutex};
++    if (hand >= host_moves.size()) return {};
++    MoveState state = host_moves[hand];
++    if (std::chrono::steady_clock::now() - move_received[hand] > std::chrono::milliseconds{250}) {
++        state.connected = false;
++        state.device.tracked = false;
++    }
++    if (!state.connected) {
++        state.buttons = 0;
++        state.trigger = 0;
++        state.device.tracked = false;
++    }
++    state.device.pose.position = PositionToTracker(state.device.pose.position);
++    state.device.pose.orientation = Normalize(Multiply(Conjugate(seat_yaw), state.device.pose.orientation));
++    state.device.linear_velocity = DirectionToTracker(state.device.linear_velocity);
++    state.device.angular_velocity = DirectionToTracker(state.device.angular_velocity);
++    return state;
++}
++
++void Runtime::SetMoveFeedbackListener(std::function<void(u32, u8)> listener) {
++    std::scoped_lock lock{mutex};
++    move_feedback_listener = std::move(listener);
++}
++
++void Runtime::SetMoveVibration(u32 hand, u8 intensity) {
++    std::function<void(u32, u8)> listener;
++    {
++        std::scoped_lock lock{mutex};
++        listener = move_feedback_listener;
++    }
++    if (hand < 2 && listener) listener(hand, intensity);
++}
++
+ void Runtime::ReleasePad() {
+     std::scoped_lock lock{mutex};
+     if (!pad_position_tracked) {
+--- a/shadps4-arm64-main/src/core/vr/vr_runtime.h
++++ b/shadps4-arm64-main/src/core/vr/vr_runtime.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <array>
+ #include <chrono>
+ #include <condition_variable>
+ #include <functional>
+@@ -58,6 +59,14 @@
+     Vec3 angular_velocity;
+     u64 sequence{}; ///< Host sample counter, 0 when the host never reported this device.
+     bool tracked{};
++};
++
++struct MoveState {
++    DeviceState device;
++    u32 buttons{};
++    float trigger{};
++    u64 timestamp{};
++    bool connected{};
+ };
+ 
+ /// What a title asks of the controller: its two rumble motors and the colour of its light.
+@@ -218,6 +227,10 @@
+     // Guest side, tracker space.
+     DeviceState GetHead();
+     DeviceState GetPad();
++    void UpdateMove(u32 hand, const MoveState& state);
++    MoveState GetMove(u32 hand) const;
++    void SetMoveVibration(u32 hand, u8 intensity);
++    void SetMoveFeedbackListener(std::function<void(u32, u8)> listener);
+ 
+     /// Converts a tracker-space pose handed back by the guest into host space.
+     Pose ToHostSpace(const Pose& tracker_pose) const;
+@@ -264,6 +277,10 @@
+     std::chrono::steady_clock::time_point seat_changed;
+     bool title_asked{};
+     DeviceState pad;
++    // Keep raw host poses: both hands are transformed using the current seat on read.
++    std::array<MoveState, 2> host_moves{};
++    std::array<std::chrono::steady_clock::time_point, 2> move_received{};
++    std::function<void(u32, u8)> move_feedback_listener;
+     bool pad_position_tracked{};
+     // Smoothed point the untracked controller hangs off.
+     Vec3 pad_anchor;

@@ -1,0 +1,7 @@
+# start seconds, hold seconds, PS4 button; no pose overrides.
+# Offset circle from the host self-test's cross pulses at multiples of 5 seconds.
+24.7 0.3 circle
+26.7 0.3 circle
+28.7 0.3 circle
+31.7 0.3 circle
+36.7 0.3 circle

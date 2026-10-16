@@ -1,0 +1,156 @@
+--- a/shadps4-arm64-main/src/core/libraries/vr_tracker/vr_tracker.cpp
++++ b/shadps4-arm64-main/src/core/libraries/vr_tracker/vr_tracker.cpp
+@@ -6,6 +6,8 @@
+ #include <mutex>
+ #include <optional>
+ #include <vector>
++#include <cstddef>
++#include "common/elf_info.h"
+ 
+ #include "common/logging/log.h"
+ #include "core/libraries/error_codes.h"
+@@ -40,9 +42,15 @@
+ };
+ static std::vector<PadRegistration> g_pads;
+ static std::mutex g_pads_mutex;
+-static s32 g_move_handle = -1;
++static std::array<s32, 2> g_move_handles{-1, -1};
++static std::mutex g_move_mutex;
+ static s32 g_gun_handle = -1;
+ static s32 g_hmd_handle = -1;
++
++static bool HasMove(s32 handle) {
++    std::scoped_lock lock{g_move_mutex};
++    return handle >= 0 && std::ranges::find(g_move_handles, handle) != g_move_handles.end();
++}
+ 
+ /// The registration of a DualShock 4 handle, if it is one.
+ static std::optional<PadRegistration> FindPad(s32 handle) {
+@@ -111,9 +119,63 @@
+     return ORBIS_OK;
+ }
+ 
++// CUSA09079's Unity 5.5 caller writes size 0x90, calibration at 0x20,
++// memory descriptors at 0x40/0x50/0x60, and queue IDs at 0x70/0x74.
++// Keep unobserved/reserved fields unnamed; the current host tracker uses only
++// the fields copied below. Do not reinterpret this as the newer 0x80 layout.
++struct KizuTrackerInit90 {
++    u32 size;
++    OrbisVrTrackerProfile profile;
++    u32 reserved_08[6];
++    OrbisVrTrackerCalibrationSettings calibration_settings;
++    void* direct_memory_onion;
++    u32 direct_memory_onion_size;
++    u32 direct_memory_onion_alignment;
++    void* direct_memory_garlic;
++    u32 direct_memory_garlic_size;
++    u32 direct_memory_garlic_alignment;
++    void* work_memory;
++    u32 work_memory_size;
++    u32 work_memory_alignment;
++    s32 gpu_pipe_id;
++    s32 gpu_queue_id;
++    u32 reserved_78[6];
++};
++static_assert(sizeof(KizuTrackerInit90) == 0x90);
++static_assert(offsetof(KizuTrackerInit90, calibration_settings) == 0x20);
++static_assert(offsetof(KizuTrackerInit90, direct_memory_onion) == 0x40);
++static_assert(offsetof(KizuTrackerInit90, gpu_pipe_id) == 0x70);
++
+ s32 PS4_SYSV_ABI sceVrTrackerInit(const OrbisVrTrackerInitParam* param) {
+     if (g_library_initialized) {
+         return ORBIS_VR_TRACKER_ERROR_ALREADY_INITIALIZED;
++    }
++    if (param == nullptr) {
++        return ORBIS_VR_TRACKER_ERROR_ARGUMENT_INVALID;
++    }
++    OrbisVrTrackerInitParam normalized{};
++    if (param->size == sizeof(KizuTrackerInit90) &&
++        Common::ElfInfo::Instance().GameSerial() == "CUSA09079") {
++        const auto& legacy = *reinterpret_cast<const KizuTrackerInit90*>(param);
++        normalized.size = sizeof(normalized);
++        normalized.profile = legacy.profile;
++        normalized.calibration_settings = legacy.calibration_settings;
++        normalized.direct_memory_onion = legacy.direct_memory_onion;
++        normalized.direct_memory_onion_size = legacy.direct_memory_onion_size;
++        normalized.direct_memory_onion_alignment = legacy.direct_memory_onion_alignment;
++        normalized.direct_memory_garlic = legacy.direct_memory_garlic;
++        normalized.direct_memory_garlic_size = legacy.direct_memory_garlic_size;
++        normalized.direct_memory_garlic_alignment = legacy.direct_memory_garlic_alignment;
++        normalized.work_memory = legacy.work_memory;
++        normalized.work_memory_size = legacy.work_memory_size;
++        normalized.work_memory_alignment = legacy.work_memory_alignment;
++        normalized.gpu_pipe_id = legacy.gpu_pipe_id;
++        normalized.gpu_queue_id = legacy.gpu_queue_id;
++        param = &normalized;
++        LOG_INFO(Lib_VrTracker,
++                 "CUSA09079 tracker 0x90 ABI: onion={:#x} garlic={:#x} work={:#x} queue={}/{}",
++                 param->direct_memory_onion_size, param->direct_memory_garlic_size,
++                 param->work_memory_size, param->gpu_pipe_id, param->gpu_queue_id);
+     }
+ 
+     // Calculate correct onion size for parameter checks
+@@ -265,10 +327,13 @@
+         break;
+     }
+     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_MOVE: {
+-        if (g_move_handle != -1) {
++        std::scoped_lock lock{g_move_mutex};
++        if (std::ranges::find(g_move_handles, handle) != g_move_handles.end()) {
+             return ORBIS_VR_TRACKER_ERROR_DEVICE_ALREADY_REGISTERED;
+         }
+-        g_move_handle = handle;
++        const auto slot = std::ranges::find(g_move_handles, -1);
++        if (slot == g_move_handles.end()) return ORBIS_VR_TRACKER_ERROR_DEVICE_LIMIT;
++        *slot = handle;
+         break;
+     }
+     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_GUN: {
+@@ -317,7 +382,7 @@
+     const auto pad_registration = FindPad(handle);
+     // (Another player's controller is registered, but nothing tracks it.)
+     const bool is_pad = pad_registration.has_value() && IsPlayersPad(handle);
+-    if (!is_hmd && !pad_registration && handle != g_move_handle && handle != g_gun_handle) {
++    if (!is_hmd && !pad_registration && !HasMove(handle) && handle != g_gun_handle) {
+         return ORBIS_VR_TRACKER_ERROR_DEVICE_NOT_REGISTERED;
+     }
+ 
+@@ -484,7 +549,8 @@
+         break;
+     }
+     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_MOVE: {
+-        if (g_move_handle == -1) {
++        std::scoped_lock lock{g_move_mutex};
++        if (std::ranges::all_of(g_move_handles, [](s32 handle) { return handle == -1; })) {
+             return ORBIS_VR_TRACKER_ERROR_DEVICE_NOT_REGISTERED;
+         }
+         break;
+@@ -650,8 +716,9 @@
+         // (The next registered, if any, is the player's from now on.)
+         std::scoped_lock lock{g_pads_mutex};
+         std::erase_if(g_pads, [&](const PadRegistration& pad) { return pad.handle == handle; });
+-    } else if (handle == g_move_handle) {
+-        g_move_handle = -1;
++    } else if (HasMove(handle)) {
++        std::scoped_lock lock{g_move_mutex};
++        std::ranges::replace(g_move_handles, handle, -1);
+     } else if (handle == g_gun_handle) {
+         g_gun_handle = -1;
+     } else {
+@@ -668,6 +735,16 @@
+         return ORBIS_VR_TRACKER_ERROR_NOT_INIT;
+     }
+     g_library_initialized = false;
++    // Termination ends registrations as well as initialization. Leaving stale
++    // handles makes a later successful Init fail to re-register the same HMD.
++    {
++        std::scoped_lock lock{g_pads_mutex, g_move_mutex};
++        g_pads.clear();
++        g_move_handles.fill(-1);
++    }
++    g_hmd_handle = g_gun_handle = -1;
++    g_onion_memory_pointer = g_garlic_memory_pointer = g_work_memory_pointer = nullptr;
++    g_onion_size = g_garlic_size = g_work_size = 0;
+     return ORBIS_OK;
+ }
+ 

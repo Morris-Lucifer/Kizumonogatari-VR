@@ -1,0 +1,15 @@
+{
+  "project": "Kizumonogatari-VR",
+  "target_title_id": "CUSA09079",
+  "game_app_version": "01.00",
+  "platform": "Quest 3 standalone",
+  "fgo_repository": "https://github.com/saberwatchmanga/FGO-VR",
+  "fgo_commit": "31d8ee83623b7f1b1d8378ffee097be51ee65eff",
+  "astro_repository": "https://github.com/bigmak94/AstroQuest",
+  "astro_commit": "9f42c44d4e838e3a0df67913e350c4f098110862",
+  "fex_repository": "https://github.com/FEX-Emu/FEX",
+  "fex_commit": "f2b679f6028ce1c38875233aecfcf5d3f8ebecec",
+  "overlay_version": "0.1.7-kizu-diagnostics",
+  "game_assets_included": false,
+  "source_layout": "FGO Quest baseline patch followed by ports/kizumonogatari native and host overlays"
+}

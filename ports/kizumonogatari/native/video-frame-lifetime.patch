@@ -1,0 +1,36 @@
+--- a/shadps4-arm64-main/src/core/libraries/avplayer/avplayer_source.cpp
++++ b/shadps4-arm64-main/src/core/libraries/avplayer/avplayer_source.cpp
+@@ -380,12 +380,8 @@
+ }
+ 
+ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
+-    if (m_current_video_frame.has_value()) {
+-        m_video_buffers.Push(std::move(m_current_video_frame->buffer));
+-        m_current_video_frame.reset();
+-        m_video_buffers_cv.Notify();
+-    }
+-
++    // A false poll means the guest keeps sampling the last returned picture.
++    // Keep that buffer out of the decoder pool until a replacement is ready.
+     if (!IsActive() || m_is_paused) {
+         const u64 count = ++m_trace_video_data_inactive_count;
+         if (ShouldTraceCount(count)) {
+@@ -431,6 +427,18 @@
+     }
+ 
+     auto frame = m_video_frames.Pop();
++    if (!frame.has_value()) {
++        return false;
++    }
++    if (m_current_video_frame.has_value()) {
++        if (!m_is_looping && frame->info.timestamp < m_current_video_frame->info.timestamp) {
++            LOG_WARNING(Lib_AvPlayer, "KIZU_VIDEO timestamp_regression previous={} next={}",
++                        m_current_video_frame->info.timestamp, frame->info.timestamp);
++        }
++        m_video_buffers.Push(std::move(m_current_video_frame->buffer));
++        m_current_video_frame.reset();
++        m_video_buffers_cv.Notify();
++    }
+     video_info = frame->info;
+     m_current_video_frame = std::move(frame);
+ 

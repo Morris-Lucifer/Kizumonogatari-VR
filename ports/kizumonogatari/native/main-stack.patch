@@ -1,0 +1,80 @@
+--- a/shadps4-arm64-main/src/core/linker.cpp
++++ b/shadps4-arm64-main/src/core/linker.cpp
+@@ -8,6 +8,7 @@
+ #include "common/logging/formatter.h"
+ #include "common/logging/log.h"
+ #include "common/path_util.h"
++#include "common/scope_exit.h"
+ #include "common/singleton.h"
+ #include "common/string_util.h"
+ #include "common/thread.h"
+@@ -29,6 +30,7 @@
+ #include "core/memory.h"
+ #include "core/tls.h"
+ #include "ipc/ipc.h"
++#include <cstdlib>
+ 
+ #ifndef _WIN32
+ #include <signal.h>
+@@ -427,6 +429,40 @@
+         return GuestExecutionFailure{GuestExecutionStage::Mapping,
+                                      stack.Error() == 0 ? ENOMEM : stack.Error()};
+     }
++
++    // RunGuestMain switches to a different mapping from the wrapper pthread's
++    // original stack. Guest stack queries (including Mono's GC root scan) must
++    // describe the stack actually used by the x86 execution context.
++    const char* stack_setting = std::getenv("BACHATA_FEX_MAIN_STACK");
++    const bool publish_guest_stack = !stack_setting || std::strcmp(stack_setting, "0") != 0;
++    auto* current_thread = Libraries::Kernel::g_curthread;
++    void* previous_stack{};
++    size_t previous_size{};
++    size_t previous_guard{};
++    if (current_thread) {
++        std::scoped_lock lock{current_thread->lock};
++        previous_stack = current_thread->attr.stackaddr_attr;
++        previous_size = current_thread->attr.stacksize_attr;
++        previous_guard = current_thread->attr.guardsize_attr;
++        LOG_INFO(Core_Linker,
++                 "FEX main stack: pthread={:#x}+{:#x} guest={:#x}+{:#x} publish={}",
++                 reinterpret_cast<VAddr>(previous_stack), previous_size,
++                 stack.Top() - stackSize, stackSize, publish_guest_stack);
++        if (publish_guest_stack) {
++            current_thread->attr.stackaddr_attr = reinterpret_cast<void*>(stack.Top() - stackSize);
++            current_thread->attr.stacksize_attr = stackSize;
++            current_thread->attr.guardsize_attr = 0;
++        }
++    }
++    SCOPE_EXIT {
++        // Restore before the mapping is released or the wrapper pthread exits.
++        if (current_thread && publish_guest_stack) {
++            std::scoped_lock lock{current_thread->lock};
++            current_thread->attr.stackaddr_attr = previous_stack;
++            current_thread->attr.stacksize_attr = previous_size;
++            current_thread->attr.guardsize_attr = previous_guard;
++        }
++    };
+ 
+     EntryParams guestParams = *params;
+     auto cursor = stack.Top();
+--- a/shadps4-arm64-main/src/core/libraries/kernel/threads/pthread_attr.cpp
++++ b/shadps4-arm64-main/src/core/libraries/kernel/threads/pthread_attr.cpp
+@@ -6,6 +6,7 @@
+ #include "core/libraries/kernel/threads/pthread.h"
+ #include "core/libraries/kernel/threads/thread_state.h"
+ #include "core/libraries/libs.h"
++#include <cstdlib>
+ 
+ namespace Libraries::Kernel {
+ 
+@@ -256,6 +257,10 @@
+         return ret;
+     }
+     PthreadAttr attr = pthread->attr;
++    if (std::getenv("BACHATA_FEX_FLIGHT_RECORDER")) {
++        LOG_INFO(Kernel_Pthread, "Guest stack query: thread={} base={:#x} size={:#x}",
++                 pthread->name, reinterpret_cast<u64>(attr.stackaddr_attr), attr.stacksize_attr);
++    }
+     if (True(pthread->flags & ThreadFlags::Detached)) {
+         attr.flags |= PthreadAttrFlags::Detached;
+     }

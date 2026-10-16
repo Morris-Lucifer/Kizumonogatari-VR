@@ -1,0 +1,256 @@
+--- a/cpp/touch_input.h
++++ b/cpp/touch_input.h
+@@ -3,7 +3,7 @@
+ #include <openxr/openxr.h>
+ #include "core_process.h"
+ 
+-// A tracked Touch controller acts as the game's single DS4, not as a fabricated Move device.
++// Touch supplies the menu pad and two independent tracked Move controllers.
+ class TouchInput {
+ public:
+     bool Initialize(XrInstance instance, XrSession session, XrSpace local);
+@@ -15,9 +15,12 @@
+     XrSpace local{};
+     XrActionSet set{};
+     XrPath hands[2]{};
+-    XrAction aim{}, sticks{}, triggers{}, grips{}, clicks{}, menu{};
++    XrAction aim{}, grip_pose{}, vibration{}, sticks{}, triggers{}, grips{}, clicks{}, menu{};
+     XrAction faces[4]{};
+-    XrSpace aim_spaces[2]{};
++    XrSpace aim_spaces[2]{}, grip_spaces[2]{};
++    uint32_t move_flags[2]{~0u, ~0u};
++    uint32_t haptic_strength[2]{};
++    XrTime haptic_until[2]{};
+     bool recenter_held{};
+     bool logged{};
+ };
+--- a/cpp/touch_input.cpp
++++ b/cpp/touch_input.cpp
+@@ -34,6 +34,8 @@
+         return Ok(xrCreateAction(set, &create, &action), name);
+     };
+     if (!make(aim, "aim", XR_ACTION_TYPE_POSE_INPUT, true) ||
++        !make(grip_pose, "grip_pose", XR_ACTION_TYPE_POSE_INPUT, true) ||
++        !make(vibration, "vibration", XR_ACTION_TYPE_VIBRATION_OUTPUT, true) ||
+         !make(sticks, "sticks", XR_ACTION_TYPE_VECTOR2F_INPUT, true) ||
+         !make(triggers, "triggers", XR_ACTION_TYPE_FLOAT_INPUT, true) ||
+         !make(grips, "grips", XR_ACTION_TYPE_FLOAT_INPUT, true) ||
+@@ -51,13 +53,15 @@
+     for (int hand = 0; hand < 2; ++hand) {
+         const char* side = hand ? "right" : "left";
+         char path[128];
+-        for (const auto& entry : {std::pair{aim, "aim/pose"}, {sticks, "thumbstick"},
++        for (const auto& entry : {std::pair{aim, "aim/pose"}, {grip_pose, "grip/pose"}, {sticks, "thumbstick"},
+                                  {triggers, "trigger/value"}, {grips, "squeeze/value"},
+                                  {clicks, "thumbstick/click"}}) {
+             std::snprintf(path, sizeof(path), "/user/hand/%s/input/%s", side, entry.second);
+             bind(entry.first, path);
+         }
+     }
++    bind(vibration, "/user/hand/left/output/haptic");
++    bind(vibration, "/user/hand/right/output/haptic");
+     bind(menu, "/user/hand/left/input/menu/click");
+     bind(faces[0], "/user/hand/right/input/a/click");
+     bind(faces[1], "/user/hand/right/input/b/click");
+@@ -77,8 +81,10 @@
+         XrActionSpaceCreateInfo space{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+         space.action = aim; space.subactionPath = hands[hand]; space.poseInActionSpace.orientation.w = 1;
+         if (!Ok(xrCreateActionSpace(session, &space, &aim_spaces[hand]), "aim space")) return false;
+-    }
+-    LOGI("Touch bridge ready: DS4 buttons, left stick directions, right aim pose; both stick clicks recenter");
++        space.action = grip_pose;
++        if (!Ok(xrCreateActionSpace(session, &space, &grip_spaces[hand]), "grip space")) return false;
++    }
++    LOGI("Touch bridge ready: independent left/right Move tracking, input and haptics; both stick clicks recenter");
+     return true;
+ }
+ 
+@@ -87,7 +93,13 @@
+     XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+     sync.countActiveActionSets = 1; sync.activeActionSets = &active;
+     if (set == XR_NULL_HANDLE || xrSyncActions(session, &sync) != XR_SUCCESS) {
+-        core.SetTouchPad({}, true); recenter_held = false; return false;
++        core.SetTouchPad({}, true);
++        for (uint32_t hand = 0; hand < 2; ++hand) {
++            Core::Vr::Protocol::MoveInput input;
++            input.hand = hand;
++            core.SendMoveInput(input);
++        }
++        recenter_held = false; return false;
+     }
+     bool available = false;
+     const auto boolean = [&](XrAction action, int hand = -1) {
+@@ -111,18 +123,22 @@
+     };
+     PadState pad;
+     const uint32_t bits[] = {0x4000, 0x8000, 0x2000, 0x1000};
+-    for (int n = 0; n < 4; ++n) if (boolean(faces[n])) pad.buttons |= bits[n];
+-    if (boolean(menu)) pad.buttons |= 0x8;
++    bool face[4]{};
++    for (int n = 0; n < 4; ++n) if ((face[n] = boolean(faces[n]))) pad.buttons |= bits[n];
++    const bool menu_down = boolean(menu);
++    if (menu_down) pad.buttons |= 0x8;
+     const bool left_click = boolean(clicks, 0), right_click = boolean(clicks, 1);
+     const bool recenter = left_click && right_click;
+     if (recenter && !recenter_held)
+         pose.flags |= Core::Vr::Protocol::PadPose::RecenterSeat | Core::Vr::Protocol::PadPose::RecenterYaw;
+     recenter_held = recenter;
+     if (!recenter) { if (left_click) pad.buttons |= 0x2; if (right_click) pad.buttons |= 0x4; }
+-    if (pull(grips, 0) > .5f) pad.buttons |= 0x400;
+-    if (pull(grips, 1) > .5f) pad.buttons |= 0x800;
+-    pad.left_trigger = static_cast<uint8_t>(std::lround(pull(triggers, 0) * 255));
+-    pad.right_trigger = static_cast<uint8_t>(std::lround(pull(triggers, 1) * 255));
++    const float squeeze[2] = {pull(grips, 0), pull(grips, 1)};
++    const float trigger[2] = {pull(triggers, 0), pull(triggers, 1)};
++    if (squeeze[0] > .5f) pad.buttons |= 0x400;
++    if (squeeze[1] > .5f) pad.buttons |= 0x800;
++    pad.left_trigger = static_cast<uint8_t>(std::lround(trigger[0] * 255));
++    pad.right_trigger = static_cast<uint8_t>(std::lround(trigger[1] * 255));
+     if (pad.left_trigger > 127) pad.buttons |= 0x100;
+     if (pad.right_trigger > 127) pad.buttons |= 0x200;
+     const auto left = stick(0), right = stick(1);
+@@ -133,6 +149,82 @@
+     if (left.y > .55f) pad.buttons |= 0x10;
+     if (left.y < -.55f) pad.buttons |= 0x40;
+     core.SetTouchPad(available ? pad : PadState{}, true);
++    for (uint32_t hand = 0; hand < 2; ++hand) {
++        Core::Vr::Protocol::MoveInput input;
++        input.hand = hand;
++        XrActionStateGetInfo move_get{XR_TYPE_ACTION_STATE_GET_INFO};
++        move_get.action = grip_pose; move_get.subactionPath = hands[hand];
++        XrActionStatePose move_state{XR_TYPE_ACTION_STATE_POSE};
++        const bool connected = XR_SUCCEEDED(xrGetActionStatePose(session, &move_get, &move_state)) && move_state.isActive;
++        if (connected) {
++            input.flags |= Core::Vr::Protocol::MoveInput::Connected;
++            input.trigger = trigger[hand];
++            // Compact libSceMove mask: face buttons 4..7, Move 11, trigger 12.
++            if (face[hand == 0 ? 2 : 0]) input.buttons |= 0x40; // X/A -> Cross
++            if (face[hand == 0 ? 3 : 1]) input.buttons |= 0x20; // Y/B -> Circle
++            if (squeeze[hand] > .5f) input.buttons |= 0x800; // grip -> Move
++            if (trigger[hand] > .5f) input.buttons |= 0x1000;
++            if (!recenter && (hand == 0 ? left_click : right_click)) input.buttons |= 0x80;
++            if ((hand == 0 ? left.y : right.y) > .55f) input.buttons |= 0x10;
++            if (hand == 0 && menu_down) input.buttons |= 0x8;
++            XrSpaceVelocity speed{XR_TYPE_SPACE_VELOCITY};
++            XrSpaceLocation at{XR_TYPE_SPACE_LOCATION}; at.next = &speed;
++            constexpr auto needed = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
++            if (XR_SUCCEEDED(xrLocateSpace(grip_spaces[hand], local, time, &at)) && (at.locationFlags & needed) == needed) {
++                input.flags |= Core::Vr::Protocol::MoveInput::Tracked;
++                const auto& q = at.pose.orientation;
++                // Kizu's Unity device model already accounts for its wand axis.
++                // Keep the grip orientation; a second quarter-turn tilts the model by 90 degrees.
++                input.orientation[0] = q.x;
++                input.orientation[1] = q.y;
++                input.orientation[2] = q.z;
++                input.orientation[3] = q.w;
++                constexpr float length = 0.12f;
++                const XrVector3f offset{
++                    -length * (2 * (q.x * q.z + q.w * q.y)),
++                    -length * (2 * (q.y * q.z - q.w * q.x)),
++                    -length * (1 - 2 * (q.x * q.x + q.y * q.y))};
++                input.position[0] = at.pose.position.x + offset.x;
++                input.position[1] = at.pose.position.y + offset.y;
++                input.position[2] = at.pose.position.z + offset.z;
++                if (speed.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) {
++                    input.linear_velocity[0] = speed.linearVelocity.x;
++                    input.linear_velocity[1] = speed.linearVelocity.y;
++                    input.linear_velocity[2] = speed.linearVelocity.z;
++                }
++                if (speed.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) {
++                    const auto& w = speed.angularVelocity;
++                    input.angular_velocity[0] = w.x;
++                    input.angular_velocity[1] = w.y;
++                    input.angular_velocity[2] = w.z;
++                    input.linear_velocity[0] += w.y * offset.z - w.z * offset.y;
++                    input.linear_velocity[1] += w.z * offset.x - w.x * offset.z;
++                    input.linear_velocity[2] += w.x * offset.y - w.y * offset.x;
++                }
++            }
++        }
++        core.SendMoveInput(input);
++        if (move_flags[hand] != input.flags) {
++            LOGI("KIZU_MOVE host hand=%u flags=%u p=%.3f,%.3f,%.3f", hand, input.flags,
++                 input.position[0], input.position[1], input.position[2]);
++            move_flags[hand] = input.flags;
++        }
++        const uint32_t strength = connected ? core.GetMoveFeedback(hand) : 0;
++        if (strength != haptic_strength[hand] || (strength && time >= haptic_until[hand])) {
++            XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
++            info.action = vibration; info.subactionPath = hands[hand];
++            if (!strength) xrStopHapticFeedback(session, &info);
++            else {
++                XrHapticVibration effect{XR_TYPE_HAPTIC_VIBRATION};
++                effect.amplitude = strength / 255.0f;
++                effect.duration = 80'000'000;
++                effect.frequency = XR_FREQUENCY_UNSPECIFIED;
++                xrApplyHapticFeedback(session, &info, reinterpret_cast<const XrHapticBaseHeader*>(&effect));
++            }
++            haptic_strength[hand] = strength;
++            haptic_until[hand] = time + 50'000'000;
++        }
++    }
+     XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO}; get.action = aim; get.subactionPath = hands[1];
+     XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE};
+     if (XR_FAILED(xrGetActionStatePose(session, &get, &state)) || !state.isActive) return false;
+@@ -156,6 +248,7 @@
+ 
+ void TouchInput::Destroy() {
+     for (auto& space : aim_spaces) { if (space) xrDestroySpace(space); space = XR_NULL_HANDLE; }
++    for (auto& space : grip_spaces) { if (space) xrDestroySpace(space); space = XR_NULL_HANDLE; }
+     if (set) xrDestroyActionSet(set);
+     set = XR_NULL_HANDLE;
+ }
+--- a/cpp/core_process.h
++++ b/cpp/core_process.h
+@@ -81,6 +81,10 @@
+     void SetBuffers(const std::vector<int>& fds, uint32_t width, uint32_t height, uint32_t stride);
+     void SendPose(const Core::Vr::Protocol::Pose& pose);
+     void SendPadPose(const Core::Vr::Protocol::PadPose& pose);
++    void SendMoveInput(const Core::Vr::Protocol::MoveInput& input);
++    uint32_t GetMoveFeedback(uint32_t hand) const {
++        return hand < 2 ? move_feedback[hand].load() : 0;
++    }
+     void SendOptics(float ipd);
+     /// The display refreshes: the emulated headset keeps step with it (`rate` in Hz).
+     void SendRefresh(float rate);
+@@ -123,6 +127,7 @@
+     std::atomic<bool> paused{};
+     std::atomic<uint64_t> presented_frames{};
+     std::atomic<uint64_t> pad_feedback{};
++    std::array<std::atomic<uint32_t>, 2> move_feedback{};
+     std::atomic<pid_t> pid{-1};
+ 
+     int control_listen{-1};
+--- a/cpp/core_process.cpp
++++ b/cpp/core_process.cpp
+@@ -1078,6 +1078,11 @@
+     }
+ }
+ 
++void CoreProcess::SendMoveInput(const Protocol::MoveInput& input) {
++    const int fd = vr_fd;
++    if (fd >= 0) ::send(fd, &input, sizeof(input), MSG_NOSIGNAL | MSG_DONTWAIT);
++}
++
+ void CoreProcess::SendOptics(float ipd) {
+     const int fd = vr_fd;
+     if (fd >= 0) {
+@@ -1134,6 +1139,7 @@
+             Protocol::Header header;
+             Protocol::Frame frame;
+             Protocol::PadFeedback feedback;
++            Protocol::MoveFeedback move_feedback;
+         } received{};
+         const ssize_t size = ::recv(fd, &received, sizeof(received), 0);
+         if (size == 0 || (size < 0 && errno != EINTR)) {
+@@ -1147,6 +1153,10 @@
+             size == static_cast<ssize_t>(sizeof(Protocol::Frame))) {
+             std::scoped_lock lock{mutex};
+             frame = received.frame;
++         } else if (received.header.type == Protocol::MessageType::MoveFeedback &&
++                   size == static_cast<ssize_t>(sizeof(Protocol::MoveFeedback))) {
++            const auto& feedback = received.move_feedback;
++            if (feedback.hand < 2) move_feedback[feedback.hand] = std::min(feedback.intensity, 255u);
+         } else if (received.header.type == Protocol::MessageType::PadFeedback &&
+                    size == static_cast<ssize_t>(sizeof(Protocol::PadFeedback))) {
+             const auto& feedback = received.feedback;

@@ -1,0 +1,24 @@
+{
+  "version": "0.1.7-kizu-diagnostics",
+  "version_code": 8,
+  "package": "com.kizuvr.quest",
+  "target_title_id": "CUSA09079",
+  "status": "experimental",
+  "apk_name": "Kizumonogatari-VR-0.1.7-Quest3-Diagnostics.apk",
+  "apk_sha256": "07e4fca5e016568e2ec90c9ab24ca6ad632d3b0c51dcbc4bf25d9b22bd3b6973",
+  "core_sha256": "f7ddf79599c09519dc26ecd18869de6e4e0c6bfab8b142974ed3dd46a76406ad",
+  "host_sha256": "8a0011b573616ffdda9a3ff29c34c62930e3a645a8c612c1009ffcb5847ef912",
+  "game_assets_included": false,
+  "original_validation_date": "2026-10-16",
+  "confirmed": [
+    "Game output on Quest 3",
+    "Transition freeze correction confirmed by wearer",
+    "Major movie corruption largely resolved",
+    "Move wand visible; physical right controls game right; orientation confirmed normal"
+  ],
+  "limitations": [
+    "Slow shattering transitions",
+    "Slight residual movie shimmer",
+    "Repeated-session stability and all button/haptic interactions not established"
+  ]
+}

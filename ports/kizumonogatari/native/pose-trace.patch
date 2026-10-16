@@ -1,0 +1,30 @@
+--- a/shadps4-arm64-main/src/core/libraries/hmd/hmd_reprojection.cpp
++++ b/shadps4-arm64-main/src/core/libraries/hmd/hmd_reprojection.cpp
+@@ -312,6 +312,27 @@
+     };
+     frame.flip_arg = flip_arg;
+ 
++    // Opt-in capture of the pose attached to the actual submitted picture.
++    // Reading the latest pose in its place would hide a mismatch, not fix it.
++    if (std::getenv("BACHATA_VR_POSE_TRACE")) {
++        static std::atomic<u32> trace_calls{};
++        const u32 call = trace_calls.fetch_add(1);
++        if (call < 12 || call % 30 == 0) {
++            const auto head = Core::Vr::Runtime::Instance().GetHead();
++            const auto& p = frame.render_pose;
++            LOG_INFO(Lib_Hmd,
++                "KIZU_POSE call={} flip={} user={} time={} sensor={} "
++                "p={},{},{} q={},{},{},{} headp={},{},{} headq={},{},{},{}",
++                call, flip_arg, tracker_state->user_frame_number, tracker_state->timestamp,
++                tracker_state->sensor_read_system_timestamp,
++                p.position.x, p.position.y, p.position.z,
++                p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w,
++                head.pose.position.x, head.pose.position.y, head.pose.position.z,
++                head.pose.orientation.x, head.pose.orientation.y,
++                head.pose.orientation.z, head.pose.orientation.w);
++        }
++    }
++
+     s32 video_out_handle;
+     u32 frame_number;
+     {

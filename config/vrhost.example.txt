@@ -1,0 +1,4 @@
+# Merge the desired settings into your existing vrhost.txt.
+stats=0
+env=SHADPS4_FEX_TSO=1
+env=SHADPS4_UNITY_LOG=1

@@ -1,0 +1,148 @@
+diff --git a/shadps4-arm64-main/src/core/fex/fex_guest_engine.cpp b/shadps4-arm64-main/src/core/fex/fex_guest_engine.cpp
+index 33227f5..6af239c 100644
+--- a/shadps4-arm64-main/src/core/fex/fex_guest_engine.cpp
++++ b/shadps4-arm64-main/src/core/fex/fex_guest_engine.cpp
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: MIT
+ 
+ #include "fex_guest_engine.h"
++#include "fex_fault_snapshot.h"
++#include "fex_signal_context.h"
+ 
+ // Ucontext layout only — do not include pthread.h here. pthread → semaphore →
+ // assert → log → spdlog, which the FEXCore-only guest harness does not provide.
+@@ -124,6 +126,13 @@ void FexMessageHandler(LogMan::DebugLevels level, const char* message) {
+   } else if (level <= LogMan::ERROR) {
+     std::fprintf(stderr, "BACHATA_FEX_ERROR level=%u %s\n", static_cast<unsigned>(level),
+                  message);
++    // NoExec is reported by the decoder on its normal execution path. Keep all
++    // new diagnostic IO out of DeliverGuestOrbisSignal's async signal path.
++    if (Diagnostics::Enabled() && std::strstr(message, "NoExec instruction in entry block") &&
++        ActiveFexExecution.Thread && ActiveFexExecution.Thread->CurrentFrame) {
++      auto* frame = ActiveFexExecution.Thread->CurrentFrame;
++      Diagnostics::DumpFault(frame->State, frame->Pointers.ThunkCallbackRet);
++    }
+   }
+ }
+ 
+@@ -559,11 +568,22 @@ public:
+       }
+     }
+ 
++    Diagnostics::SignalState diagnostic_signal_state;
++    diagnostic_signal_state.Save(state);
++    Diagnostics::RecordState("signal-save", state, handler);
+     // Save interrupted frame (may hold host values mid-HLE).
+     std::array<uint64_t, 16> saved_gprs {};
+     std::copy(std::begin(state.gregs), std::begin(state.gregs) + 16, saved_gprs.begin());
+     const uint64_t saved_rip = state.rip;
+     const uint64_t saved_rsp = state.gregs[REG_RSP];
++    FEXCore::Core::CPUState saved_state;
++    RestoreSignalState(saved_state, state);
++    static const bool complete_signal_context = [] {
++      const char* value = std::getenv("BACHATA_FEX_SIGNAL_CONTEXT");
++      return !value || std::strcmp(value, "0") != 0;
++    }();
++    const uint32_t saved_eflags = complete_signal_context
++      ? ctx->ReconstructCompactedEFLAGS(thread, false, nullptr, 0) : 0;
+     if (!looks_guest(work_rsp)) {
+       std::fprintf(stderr,
+                    "BACHATA_FEX_SIGNAL flush abort: no guest stack frame_rsp=%#lx\n",
+@@ -611,6 +631,9 @@ public:
+       mc.mc_gsbase = state.gs_cached;
+       mc.mc_fs = static_cast<u16>(state.fs_cached & 0xffff);
+       mc.mc_gs = static_cast<u16>(state.gs_cached & 0xffff);
++      if (complete_signal_context) {
++        FillSignalContext(mc, saved_state, work_rsp, saved_eflags);
++      }
+       // Handler stack below the uctx blob.
+       state.gregs[REG_RSP] = ctx_addr;
+     }
+@@ -686,7 +709,9 @@ public:
+     std::fprintf(stderr, "BACHATA_FEX_SIGNAL callback_ret=%#lx\n",
+                  static_cast<unsigned long>(thread->CurrentFrame->Pointers.ThunkCallbackRet));
+ 
++    Diagnostics::RecordState("signal-enter", state, handler);
+     ctx->HandleCallback(thread, handler);
++    Diagnostics::RecordState("signal-return", state, diagnostic_signal_state.Changes(state));
+ 
+     std::fprintf(stderr, "BACHATA_FEX_SIGNAL handler returned rip=%#lx rsp=%#lx\n",
+                  static_cast<unsigned long>(state.rip),
+@@ -696,6 +721,10 @@ public:
+     std::copy(saved_gprs.begin(), saved_gprs.end(), std::begin(state.gregs));
+     state.rip = saved_rip;
+     state.gregs[REG_RSP] = saved_rsp;
++    if (complete_signal_context) {
++      RestoreSignalState(state, saved_state);
++    }
++    Diagnostics::RecordState("signal-restored", state, diagnostic_signal_state.Changes(state));
+     PendingOrbisSignal.Flushing = false;
+   }
+ 
+@@ -711,6 +740,7 @@ public:
+       return static_cast<uint64_t>(-EFAULT);
+     }
+ 
++    if (Diagnostics::Enabled()) Diagnostics::BoundaryRip = frame->State.rip;
+     GuestCpu::HleCallFrame hleFrame{};
+     hleFrame.operation = frame->State.gregs[FEXCore::X86State::REG_RAX];
+     std::copy(std::begin(frame->State.gregs), std::end(frame->State.gregs), hleFrame.gpr.begin());
+@@ -1443,7 +1473,9 @@ EngineResult<GuestExecutionState> GuestEngine::Run(Thread& thread) {
+     FexExecutionSignalScope signalScope {*ImplState->Context, thread.Native,
+                                          ImplState->SignalDelegator.get(),
+                                          ImplState->Syscalls.get()};
++    Diagnostics::RecordState("run-enter", thread.Native->CurrentFrame->State, thread.FirstRip);
+     ImplState->Context->ExecuteThread(thread.Native);
++    Diagnostics::RecordState("run-return", thread.Native->CurrentFrame->State);
+   }
+   if (ImplState->Syscalls->FailureResult(thread.Invocation)) {
+     return *ImplState->Syscalls->FailureResult(thread.Invocation);
+@@ -1507,7 +1539,9 @@ EngineResult<GuestExecutionState> GuestEngine::CallGuest(
+     FexExecutionSignalScope signalScope {*ImplState->Context, thread,
+                                          ImplState->SignalDelegator.get(),
+                                          ImplState->Syscalls.get()};
++    Diagnostics::RecordState("callback-enter", frame, rip);
+     ImplState->Context->HandleCallback(thread, rip);
++    Diagnostics::RecordState("callback-return", frame, rip);
+   }
+   if (ImplState->Syscalls->FailureResult(invocation)) {
+     return *ImplState->Syscalls->FailureResult(invocation);
+diff --git a/shadps4-arm64-main/src/core/guest_cpu/fex_hle_bridge.cpp b/shadps4-arm64-main/src/core/guest_cpu/fex_hle_bridge.cpp
+index 2914029..08258c3 100644
+--- a/shadps4-arm64-main/src/core/guest_cpu/fex_hle_bridge.cpp
++++ b/shadps4-arm64-main/src/core/guest_cpu/fex_hle_bridge.cpp
+@@ -3,6 +3,7 @@
+ #include "fex_hle_bridge.h"
+ #include "guest_watchdog.h"
+ #include "hle_trace.h"
++#include "core/fex/fex_flight_recorder.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -243,7 +244,10 @@ Fex::EngineResult<bool> HleGuestBridge::Invoke(HleCallFrame& frame) {
+         held = registry.Find(frame.operation);
+         adapter = held.get();
+     }
++    Fex::Diagnostics::HleScope flight_call{frame.operation,
++        adapter ? adapter->Name() : std::string_view{"unregistered"}, frame.rsp, frame.gpr[5], frame.gpr.data()};
+     if (adapter == nullptr) {
++        flight_call.Finish(0, ENOSYS);
+         const HleCallFailure failure{ENOSYS, "unregistered HLE operation"};
+         Report(failure);
+         return Fex::EngineFailure{Fex::EngineStage::Bridge, failure.error};
+@@ -273,6 +277,7 @@ Fex::EngineResult<bool> HleGuestBridge::Invoke(HleCallFrame& frame) {
+     const ActivityScope activity{frame};
+     const auto result = adapter->Invoke(frame);
+     if (const auto* failure = std::get_if<HleCallFailure>(&result)) {
++        flight_call.Finish(frame.gpr[0], failure->error);
+         if (trace) {
+             std::fprintf(stderr,
+                          "BACHATA_FEX_HLE_END index=%u operation=%llu name=%.*s error=%d\n",
+@@ -283,6 +288,7 @@ Fex::EngineResult<bool> HleGuestBridge::Invoke(HleCallFrame& frame) {
+         Report(*failure);
+         return Fex::EngineFailure{Fex::EngineStage::Bridge, failure->error};
+     }
++    flight_call.Finish(frame.gpr[0]);
+     if (trace) {
+         std::fprintf(stderr,
+                      "BACHATA_FEX_HLE_END index=%u operation=%llu name=%.*s rax=%#llx\n",

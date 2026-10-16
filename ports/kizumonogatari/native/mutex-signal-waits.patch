@@ -1,0 +1,71 @@
+--- a/shadps4-arm64-main/src/core/libraries/kernel/sync/mutex.h
++++ b/shadps4-arm64-main/src/core/libraries/kernel/sync/mutex.h
+@@ -11,6 +11,12 @@
+ #include <windows.h>
+ #else
+ #include <mutex>
++#endif
++
++#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
++namespace Core::Fex {
++void FlushPendingGuestOrbisSignal() noexcept;
++}
+ #endif
+ 
+ namespace Libraries::Kernel {
+@@ -42,6 +48,8 @@
+         }
+ 
+         return try_lock_until(abs_time);
++#elif defined(SHADPS4_ENABLE_FEX_GUEST_CPU)
++        return try_lock_until(std::chrono::steady_clock::now() + rel_time);
+ #else
+         return mtx.try_lock_for(rel_time);
+ #endif
+@@ -64,6 +72,27 @@
+                 return false;
+             }
+         }
++#elif defined(SHADPS4_ENABLE_FEX_GUEST_CPU)
++        // Match timed_mutex: an available mutex may be acquired even when the
++        // supplied deadline has passed. Never deliver a callback after acquiring
++        // it, before PthreadMutex has installed the guest owner.
++        if (mtx.try_lock()) {
++            return true;
++        }
++        for (;;) {
++            const auto now = Clock::now();
++            if (now >= abs_time) {
++                return false;
++            }
++            const auto next_poll = now + std::chrono::milliseconds{25};
++            if (mtx.try_lock_until(abs_time < next_poll ? abs_time : next_poll)) {
++                return true;
++            }
++            // A GC collector can own this mutex while waiting for our suspend
++            // acknowledgment. A host mutex wait does not return on pthread_kill,
++            // so pump deferred guest signals only while the mutex is not held.
++            Core::Fex::FlushPendingGuestOrbisSignal();
++        }
+ #else
+         return mtx.try_lock_until(abs_time);
+ #endif
+--- a/shadps4-arm64-main/src/core/libraries/kernel/sync/mutex.cpp
++++ b/shadps4-arm64-main/src/core/libraries/kernel/sync/mutex.cpp
+@@ -28,6 +28,16 @@
+             return;
+         }
+     }
++#elif defined(SHADPS4_ENABLE_FEX_GUEST_CPU)
++    if (mtx.try_lock()) {
++        return;
++    }
++    while (!mtx.try_lock_for(std::chrono::milliseconds{25})) {
++        // Service the suspend request without acquiring the collector's mutex.
++        // Successful acquisition returns directly so the guest owner is set
++        // before any nested guest callback can attempt to use this lock.
++        Core::Fex::FlushPendingGuestOrbisSignal();
++    }
+ #else
+     mtx.lock();
+ #endif

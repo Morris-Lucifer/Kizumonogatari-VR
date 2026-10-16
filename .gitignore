@@ -1,0 +1,49 @@
+# Local dependencies, builds and private diagnostics
+/evidence/
+/.local/
+/release-local/
+/build/
+/dist/
+__pycache__/
+*.pyc
+*.log
+*.dmp
+*.core
+
+# Binary downloads belong in Releases, not source history
+*.apk
+*.zip
+*.7z
+*.exe
+*.dll
+*.so
+*.a
+*.o
+*.obj
+*.unstripped
+
+# Game/console data and signing credentials
+/games/
+/assets/
+*.pkg
+eboot.bin
+*.prx
+*.sprx
+**/savedata/
+**/home/
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+keys.json
+.env
+.env.*
+auth/
+local_auth/
+
+# Local editor/OS files
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

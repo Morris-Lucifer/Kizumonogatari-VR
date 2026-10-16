@@ -1,0 +1,174 @@
+--- a/shadps4-arm64-main/src/core/libraries/avplayer/avplayer_source.cpp
++++ b/shadps4-arm64-main/src/core/libraries/avplayer/avplayer_source.cpp
+@@ -1,7 +1,10 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
++#include <cstring>
+ #include "common/alignment.h"
++#include "common/elf_info.h"
+ #include "common/singleton.h"
+ #include "common/thread.h"
+ #include "core/file_sys/fs.h"
+@@ -38,6 +41,10 @@
+ }
+ 
+ bool AvPlayerSource::Init(const AvPlayerInitData& init_data, std::string_view path) {
++    const char* snapshot_option = std::getenv("BACHATA_VIDEO_SNAPSHOTS");
++    m_video_snapshots = Common::ElfInfo::Instance().GameSerial() == "CUSA09079" &&
++                        !(snapshot_option && std::strcmp(snapshot_option, "0") == 0);
++    LOG_INFO(Lib_AvPlayer, "KIZU_VIDEO published_snapshots={}", m_video_snapshots);
+     m_memory_replacement = init_data.memory_replacement;
+     m_max_num_video_framebuffers =
+         std::min(std::max(2, init_data.num_output_video_framebuffers), 16);
+@@ -442,6 +449,13 @@
+     video_info = frame->info;
+     m_current_video_frame = std::move(frame);
+ 
++    if (const auto& snapshot = m_current_video_frame->video_snapshot) {
++        const auto address = reinterpret_cast<VAddr>(video_info.p_data);
++        Core::VideoFrameSnapshotStore::Instance().Publish(address, snapshot);
++        // Publish first, release the registry lock, then invalidate. Preparing a
++        // decode-ahead frame must not change the picture used by an older draw.
++        Core::Memory::Instance()->InvalidateMemory(address, snapshot->pixels.size());
++    }
+     const u64 count = ++m_trace_video_data_success_count;
+     if (ShouldTraceCount(count)) {
+         LOG_INFO(Lib_AvPlayer,
+@@ -764,8 +778,6 @@
+     ASSERT(frame.format == AV_PIX_FMT_NV12);
+ 
+     auto p_buffer = buffer.GetBuffer();
+-    CopyNV12Data(p_buffer, frame, m_use_vdec2);
+-
+     const auto stream = m_avformat_context->streams[m_video_stream_index.value()];
+     const auto timestamp = FrameTimestampMillis(frame, stream->time_base);
+ 
+@@ -775,8 +787,21 @@
+         width = Common::AlignUp(width, 16);
+         height = Common::AlignUp(height, 16);
+     }
+-    Core::Memory::Instance()->InvalidateMemory(reinterpret_cast<VAddr>(p_buffer),
+-                                               (width * height * 3) / 2);
++    const auto size = (width * height * 3) / 2;
++    std::shared_ptr<const Core::VideoFrameSnapshot> snapshot;
++    if (m_video_snapshots) {
++        auto prepared = std::make_shared<Core::VideoFrameSnapshot>();
++        prepared->pixels.resize(size);
++        prepared->timestamp = timestamp;
++        CopyNV12Data(prepared->pixels.data(), frame, m_use_vdec2);
++        // Guest CPU readers still receive the normal decoder allocation. GPU
++        // image uploads use its last published snapshot while this is rewritten.
++        std::memcpy(p_buffer, prepared->pixels.data(), size);
++        snapshot = std::move(prepared);
++    } else {
++        CopyNV12Data(p_buffer, frame, m_use_vdec2);
++        Core::Memory::Instance()->InvalidateMemory(reinterpret_cast<VAddr>(p_buffer), size);
++    }
+ 
+     return Frame{
+         .buffer = std::move(buffer),
+@@ -802,6 +827,7 @@
+                             },
+                     },
+             },
++        .video_snapshot = std::move(snapshot),
+     };
+ }
+ 
+--- a/shadps4-arm64-main/src/core/libraries/avplayer/avplayer_source.h
++++ b/shadps4-arm64-main/src/core/libraries/avplayer/avplayer_source.h
+@@ -18,6 +18,7 @@
+ #include "core/libraries/avplayer/avplayer_common.h"
+ #include "core/libraries/avplayer/avplayer_data_streamer.h"
+ #include "core/libraries/kernel/threads.h"
++#include "core/video_frame_snapshot.h"
+ 
+ struct AVCodecContext;
+ struct AVFormatContext;
+@@ -54,6 +55,8 @@
+     ~GuestBuffer() {
+         if (m_data != nullptr) {
+             if (m_is_texture) {
++                Core::VideoFrameSnapshotStore::Instance().Forget(
++                    reinterpret_cast<std::uintptr_t>(m_data));
+                 DeallocateTexture(m_memory_replacement, m_data);
+             } else {
+                 Deallocate(m_memory_replacement, m_data);
+@@ -108,6 +111,7 @@
+ struct Frame {
+     GuestBuffer buffer;
+     AvPlayerFrameInfoEx info;
++    std::shared_ptr<const Core::VideoFrameSnapshot> video_snapshot;
+ };
+ 
+ class EventCV {
+@@ -193,6 +197,7 @@
+ 
+     AvPlayerStateCallback& m_state;
+     bool m_use_vdec2 = false;
++    bool m_video_snapshots = false;
+ 
+     AvPlayerMemAllocator m_memory_replacement{};
+     u32 m_max_num_video_framebuffers{};
+--- a/shadps4-arm64-main/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/shadps4-arm64-main/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -12,6 +12,7 @@
+ #include "common/scope_exit.h"
+ #include "core/emulator_settings.h"
+ #include "core/memory.h"
++#include "core/video_frame_snapshot.h"
+ #include "video_core/amdgpu/liverpool.h"
+ #include "video_core/amdgpu/pm4_packet.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+@@ -691,6 +692,49 @@
+ 
+ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
+     LogStagingDiagConfigOnce();
++
++    if (const auto snapshot = Core::VideoFrameSnapshotStore::Instance().Find(gpu_addr, size)) {
++        // Never copy a decoder-owned NV12 allocation while it is being cleared
++        // or filled. This immutable generation was published by GetVideoData.
++        const auto* pixels = snapshot->frame->pixels.data() + snapshot->offset;
++        Buffer* upload = &staging_buffer;
++        auto [data, offset] = staging_buffer.Map(size, 16);
++        if (data) {
++            std::memcpy(data, pixels, size);
++            staging_buffer.Commit();
++        } else {
++            // A private StreamBuffer also flushes non-coherent host memory.
++            auto temporary = std::make_unique<StreamBuffer>(instance, scheduler,
++                                                            MemoryUsage::Upload, size);
++            const auto [temporary_data, temporary_offset] = temporary->Map(size, 16);
++            std::memcpy(temporary_data, pixels, size);
++            temporary->Commit();
++            upload = temporary.get();
++            offset = temporary_offset;
++            scheduler.DeferOperation([buffer = std::move(temporary)]() mutable { buffer.reset(); });
++        }
++        static u64 snapshot_uploads = 0;
++        const auto count = ++snapshot_uploads;
++        if (count <= 10 || (count & (count - 1)) == 0) {
++            LOG_INFO(Render_Vulkan,
++                     "KIZU_VIDEO snapshot_upload count={} address={:#x} offset={:#x} "
++                     "size={:#x} frame_ts={} tick={}",
++                     count, snapshot->address, snapshot->offset, size,
++                     snapshot->frame->timestamp, scheduler.CurrentTick());
++        }
++        return {upload, offset};
++    }
++    if (const auto snapshot = Core::VideoFrameSnapshotStore::Instance().Find(gpu_addr, 1)) {
++        static u64 snapshot_range_misses = 0;
++        const auto count = ++snapshot_range_misses;
++        if (count <= 10 || (count & (count - 1)) == 0) {
++            LOG_WARNING(Render_Vulkan,
++                        "KIZU_VIDEO snapshot_range_miss count={} address={:#x} "
++                        "offset={:#x} requested={:#x} available={:#x}",
++                        count, snapshot->address, snapshot->offset, size,
++                        snapshot->frame->pixels.size() - snapshot->offset);
++        }
++    }
+ 
+     // Mali dig opt-in only. Forcing the multi-slot Upload ring for all FHD on Turnip
+     // skipped SynchronizeBuffer and copied sparse guest memory into host-visible
