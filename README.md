@@ -8,7 +8,8 @@ APK 是适配运行程序，不包含游戏资源。安装后，把自己拥有�
 复制到头显。准备完成后，画面在 Quest 本地生成，无需 PC 串流。
 APK 的 0.1.7 是适配程序版本，不是 PS4 游戏更新版本。
 
-直接游玩可下载 Releases 中的 APK，无需克隆源码或安装 FGO APK。
+直接游玩请下载 [0.1.7 APK](https://github.com/Morris-Lucifer/Kizumonogatari-VR/releases/download/v0.1.7/Kizumonogatari-VR-0.1.7-Quest3-Diagnostics.apk)
+（[Release 页面](https://github.com/Morris-Lucifer/Kizumonogatari-VR/releases/tag/v0.1.7)），无需克隆源码或安装 FGO APK。
 克隆仓库用于自行构建；构建脚本所需的 FGO APK 只是公共运行组件的来源，
 与 FGO 游戏本体无关。
 
@@ -21,7 +22,7 @@ APK 的 0.1.7 是适配程序版本，不是 PS4 游戏更新版本。
 使用 Android platform-tools 的 `adb`，以下命令假定只连接一台已授权设备。
 多设备时在每条 `adb` 后加入 `-s <设备序列号>`。
 
-从仓库的 Releases 页面下载 `Kizumonogatari-VR-0.1.7-Quest3-Diagnostics.apk`，
+下载上方的 `Kizumonogatari-VR-0.1.7-Quest3-Diagnostics.apk`，
 在 APK 所在目录打开 PowerShell，执行以下命令。
 
 ```powershell
@@ -113,6 +114,11 @@ adb shell am force-stop com.kizuvr.quest
 
 克隆仓库，或下载源码 ZIP 并解压。在仓库根目录打开 PowerShell，
 按以下步骤准备依赖、编译并生成 Quest APK。
+
+Release 附件 `Kizumonogatari-VR-0.1.7-Native-Sources.zip` 另外提供已应用修改的
+模拟器、Android 主程序、FEX 及已检出的依赖源码，保留其许可证；
+归档内的 `SOURCE_MANIFEST.json` 记录来源提交、文件哈希和对应 APK 哈希。
+构建脚本、补丁、固定工具版本及构建步骤在本仓库中。
 
 ### 前提与固定输入
 
